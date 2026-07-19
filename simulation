@@ -1,0 +1,1055 @@
+# =======================================================
+# COMPREHENSIVE ANALYSIS: Shrinkage Estimators with RSS
+# FINAL CORRECTED VERSION - WITH ALL FIXES
+# - FIXED DATA for all R0 values (MLE is constant)
+# - CORRECTED Sample Size Analysis (new data for each n)
+# - ALL ESTIMATORS in plots
+#
+# UPDATED to match the revised manuscript:
+# - calculate_R_k_n now implements the corrected closed-form theorem
+#   (double finite sum) instead of the erroneous single-term ratio that
+#   was in the original manuscript; it is numerically identical to the
+#   Beta-function formula this script already used, so no simulation
+#   numbers change (see _self_check_R_k_n).
+# - k / n_sys refer to the "at least k of n survive" event, with X_(k)
+#   indexed in decreasing order as clarified in the paper's new
+#   "Indexing Convention" remark.
+# - Bootstrap replications raised from 50 to 200 per the paper's added
+#   caveat on B; still below the literature's B>=1000 rule of thumb for
+#   percentile CIs because this is a nested bootstrap (see comment at
+#   the n_boot argument in main()).
+# =======================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.optimize import minimize
+from scipy.special import beta, comb
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(1234)
+
+# =======================================================
+# Plot Settings
+# =======================================================
+plt.rcParams['font.size'] = 12
+plt.rcParams['figure.figsize'] = (10, 6)
+plt.rcParams['savefig.dpi'] = 300
+plt.rcParams['savefig.bbox'] = 'tight'
+sns.set_style("whitegrid")
+
+print("=" * 70)
+print("COMPREHENSIVE ANALYSIS: Shrinkage Estimators with RSS (FINAL)")
+print("FIXED DATA for all R0 values (MLE is constant)")
+print("CORRECTED Sample Size Analysis")
+print("=" * 70)
+
+
+# =======================================================
+# 1. Core Functions
+# =======================================================
+
+def generate_rss(n, m, theta):
+    """Generate Ranked Set Sampling (RSS) data"""
+    num_sets = int(np.ceil(n / m))
+    rss_data = []
+    for i in range(num_sets):
+        sample = np.random.exponential(scale=1/theta, size=m)
+        sorted_sample = np.sort(sample)
+        rank_idx = i % m
+        rss_data.append(sorted_sample[rank_idx])
+    return np.array(rss_data[:n])
+
+
+def calculate_R_k_n(theta1, theta2, k, n_sys):
+    """
+    Closed-form reliability of a k-out-of-n system, exponential stress-strength
+    model, matching Theorem "Closed-Form Reliability for Exponential
+    Distribution" (eq. Rkn_exp) in the REVISED manuscript:
+
+        R_{k:n} = sum_{j=k}^{n} C(n,j) * sum_{p=0}^{n-j} C(n-j,p) * (-1)^p
+                  * theta2 / (theta1*(j+p) + theta2)
+
+    obtained by expanding (1 - e^{-theta1 x})^{n-j} with the binomial theorem
+    before integrating (the previous manuscript version collapsed the
+    intermediate Beta-function expression to a single-term ratio
+    theta1/(theta1+j*theta2), which is algebraically wrong for j < n; see
+    the Remark following the corrected theorem).
+
+    Indexing convention (see "Indexing Convention" remark in the revised
+    paper): X_(k) is the k-th LARGEST strength (decreasing order), so
+    R_{k:n} = P(at least k of the n components survive the stress Y).
+    """
+    R = 0.0
+    for j in range(k, n_sys + 1):
+        cnj = comb(n_sys, j)
+        inner = 0.0
+        for p in range(0, n_sys - j + 1):
+            cjp = comb(n_sys - j, p)
+            sign = (-1) ** p
+            inner += cjp * sign * (theta2 / (theta1 * (j + p) + theta2))
+        R += cnj * inner
+    return min(max(R, 0), 1)
+
+
+def _calculate_R_k_n_beta_form(theta1, theta2, k, n_sys):
+    """
+    Reference implementation using the general-GEF Beta-function form
+    (Remark eq:Rkn_gef in the paper): R_{k:n} = sum_j C(n,j)*(theta2/theta1)*
+    B(j+theta2/theta1, n-j+1). Kept only to cross-check calculate_R_k_n
+    numerically (the two formulas must agree for the exponential case).
+    """
+    R = 0.0
+    ratio = theta2 / theta1
+    for j in range(k, n_sys + 1):
+        comb_val = comb(n_sys, j)
+        beta_val = beta(j + ratio, n_sys - j + 1)
+        R += comb_val * ratio * beta_val
+    return min(max(R, 0), 1)
+
+
+def _self_check_R_k_n(n_trials=200, seed=0):
+    """Sanity check: the corrected double-sum formula must agree with the
+    general Beta-function form for random (theta1, theta2, k, n_sys)."""
+    rng = np.random.RandomState(seed)
+    max_diff = 0.0
+    for _ in range(n_trials):
+        t1 = rng.uniform(0.2, 5.0)
+        t2 = rng.uniform(0.2, 5.0)
+        n_sys = rng.randint(1, 8)
+        k = rng.randint(1, n_sys + 1)
+        r1 = calculate_R_k_n(t1, t2, k, n_sys)
+        r2 = _calculate_R_k_n_beta_form(t1, t2, k, n_sys)
+        max_diff = max(max_diff, abs(r1 - r2))
+    assert max_diff < 1e-8, f"Mismatch between closed-form and Beta-form: {max_diff}"
+    return max_diff
+
+
+def compute_R_mle_and_se(data_x, data_y, k, n_sys):
+    """Compute R_mle and its standard error using delta method"""
+    theta1_hat = 1 / np.mean(data_x) if np.mean(data_x) > 0 else 1.0
+    theta2_hat = 1 / np.mean(data_y) if np.mean(data_y) > 0 else 1.0
+    R_mle = calculate_R_k_n(theta1_hat, theta2_hat, k, n_sys)
+    
+    n1 = len(data_x)
+    n2 = len(data_y)
+    var_theta1 = theta1_hat**2 / n1
+    var_theta2 = theta2_hat**2 / n2
+    
+    eps = 1e-6
+    R_plus1 = calculate_R_k_n(theta1_hat + eps, theta2_hat, k, n_sys)
+    R_minus1 = calculate_R_k_n(theta1_hat - eps, theta2_hat, k, n_sys)
+    dR_dtheta1 = (R_plus1 - R_minus1) / (2 * eps)
+    
+    R_plus2 = calculate_R_k_n(theta1_hat, theta2_hat + eps, k, n_sys)
+    R_minus2 = calculate_R_k_n(theta1_hat, theta2_hat - eps, k, n_sys)
+    dR_dtheta2 = (R_plus2 - R_minus2) / (2 * eps)
+    
+    var_R_mle = (dR_dtheta1**2) * var_theta1 + (dR_dtheta2**2) * var_theta2
+    var_R_mle = max(var_R_mle, 1e-10)
+    se_R_mle = np.sqrt(var_R_mle)
+    
+    return R_mle, se_R_mle, var_R_mle
+
+
+def compute_optimal_shrinkage_coefficient(var_R_mle, delta_sq):
+    """d* = σ² / (σ² + δ²)"""
+    return var_R_mle / (var_R_mle + delta_sq + 1e-10)
+
+
+def shrinkage_estimators_fixed(data_x, data_y, R0, k, n_sys, alpha=0.7,
+                                R_mle=None, se_R_mle=None, var_R_mle=None):
+    """Compute all shrinkage estimators with pre-computed R_mle"""
+    if R_mle is None or se_R_mle is None:
+        R_mle, se_R_mle, var_R_mle = compute_R_mle_and_se(data_x, data_y, k, n_sys)
+    
+    var_R = var_R_mle
+    delta = R_mle - R0
+    delta_sq = delta**2
+    ell_R = delta_sq / (var_R + 1e-10)
+    d_optimal = compute_optimal_shrinkage_coefficient(var_R, delta_sq)
+    
+    # 1. MLE
+    R_mle_value = R_mle
+    
+    # 2. Stein-Type Estimator (Weighted Average Form)
+    denom = ell_R + d_optimal + 1e-10
+    weight_mle = ell_R / denom
+    weight_R0 = d_optimal / denom
+    R_stein = weight_mle * R_mle + weight_R0 * R0
+    
+    # 3. Positive-Part Stein
+    if ell_R > 1e-10:
+        shrinkage_factor = max(0, 1 - d_optimal / ell_R)
+        R_stein_positive = R0 + shrinkage_factor * (R_mle - R0)
+    else:
+        R_stein_positive = R0
+    
+    # 4. Preliminary Test Estimator
+    chi2_critical = stats.chi2.ppf(0.95, df=1)
+    w = alpha
+    if ell_R <= chi2_critical:
+        R_pte = R_mle - w * (R_mle - R0)
+    else:
+        R_pte = R_mle
+    
+    # 5. Constant Weight
+    R_cw = alpha * R_mle + (1 - alpha) * R0
+    
+    # 6. Thompson
+    R_th = R_mle - (R_mle - R0) / (1 + ell_R)
+    
+    # 7. Mehta-Srinivasan
+    R_ms = R_th if ell_R < chi2_critical else R_mle
+    
+    return {
+        'R_mle': R_mle_value,
+        'R_cw': R_cw,
+        'R_th': R_th,
+        'R_ms': R_ms,
+        'R_stein': R_stein,
+        'R_stein_positive': R_stein_positive,
+        'R_pte': R_pte,
+        'var_R_mle': var_R_mle,
+        'se_R_mle': se_R_mle,
+        'ell_R': ell_R,
+        'd_optimal': d_optimal,
+        'weight_mle': weight_mle
+    }
+
+
+def bootstrap_se_fixed(data_x, data_y, R0, k, n_sys, alpha=0.7, 
+                        n_boot=200, R_mle=None, se_R_mle=None, var_R_mle=None):
+    """
+    Compute standard errors via bootstrap with fixed data
+    """
+    n_x = len(data_x)
+    n_y = len(data_y)
+    
+    estimator_names = ['MLE', 'CW', 'Thompson', 'MS', 'Stein', 'PS', 'PTE']
+    boot_estimates = {name: [] for name in estimator_names}
+    
+    if R_mle is None or se_R_mle is None:
+        R_mle, se_R_mle, var_R_mle = compute_R_mle_and_se(data_x, data_y, k, n_sys)
+    
+    for _ in range(n_boot):
+        idx_x = np.random.choice(n_x, n_x, replace=True)
+        idx_y = np.random.choice(n_y, n_y, replace=True)
+        boot_x = data_x[idx_x]
+        boot_y = data_y[idx_y]
+        
+        theta1_boot = 1 / np.mean(boot_x) if np.mean(boot_x) > 0 else 1.0
+        theta2_boot = 1 / np.mean(boot_y) if np.mean(boot_y) > 0 else 1.0
+        R_mle_boot = calculate_R_k_n(theta1_boot, theta2_boot, k, n_sys)
+        
+        n1 = len(boot_x)
+        n2 = len(boot_y)
+        var_theta1 = theta1_boot**2 / n1
+        var_theta2 = theta2_boot**2 / n2
+        
+        eps = 1e-6
+        R_plus1 = calculate_R_k_n(theta1_boot + eps, theta2_boot, k, n_sys)
+        R_minus1 = calculate_R_k_n(theta1_boot - eps, theta2_boot, k, n_sys)
+        dR_dtheta1 = (R_plus1 - R_minus1) / (2 * eps)
+        
+        R_plus2 = calculate_R_k_n(theta1_boot, theta2_boot + eps, k, n_sys)
+        R_minus2 = calculate_R_k_n(theta1_boot, theta2_boot - eps, k, n_sys)
+        dR_dtheta2 = (R_plus2 - R_minus2) / (2 * eps)
+        
+        var_R_mle_boot = (dR_dtheta1**2) * var_theta1 + (dR_dtheta2**2) * var_theta2
+        se_R_mle_boot = np.sqrt(max(var_R_mle_boot, 1e-10))
+        
+        boot_est = shrinkage_estimators_fixed(
+            boot_x, boot_y, R0, k, n_sys, alpha,
+            R_mle=R_mle_boot, se_R_mle=se_R_mle_boot, var_R_mle=var_R_mle_boot
+        )
+        
+        boot_estimates['MLE'].append(boot_est['R_mle'])
+        boot_estimates['CW'].append(boot_est['R_cw'])
+        boot_estimates['Thompson'].append(boot_est['R_th'])
+        boot_estimates['MS'].append(boot_est['R_ms'])
+        boot_estimates['Stein'].append(boot_est['R_stein'])
+        boot_estimates['PS'].append(boot_est['R_stein_positive'])
+        boot_estimates['PTE'].append(boot_est['R_pte'])
+    
+    se_results = {
+        'MLE': np.std(boot_estimates['MLE']),
+        'CW': np.std(boot_estimates['CW']),
+        'Thompson': np.std(boot_estimates['Thompson']),
+        'MS': np.std(boot_estimates['MS']),
+        'Stein': np.std(boot_estimates['Stein']),
+        'PS': np.std(boot_estimates['PS']),
+        'PTE': np.std(boot_estimates['PTE'])
+    }
+    
+    est_orig = shrinkage_estimators_fixed(
+        data_x, data_y, R0, k, n_sys, alpha,
+        R_mle=R_mle, se_R_mle=se_R_mle, var_R_mle=var_R_mle
+    )
+    
+    est_values = {
+        'MLE': est_orig['R_mle'],
+        'CW': est_orig['R_cw'],
+        'Thompson': est_orig['R_th'],
+        'MS': est_orig['R_ms'],
+        'Stein': est_orig['R_stein'],
+        'PS': est_orig['R_stein_positive'],
+        'PTE': est_orig['R_pte']
+    }
+    
+    return est_values, se_results
+
+
+# =======================================================
+# 2. Simulation with FIXED DATA for all R0 (MLE is constant)
+# =======================================================
+
+def simulate_scenario_fixed_data_all_R0(n, m, theta1, theta2, k, n_sys, R_true,
+                                        R0_values, num_iter=500, alpha=0.7,
+                                        n_boot=200):
+    """
+    Simulation with FIXED DATA for all R0 values
+    MLE is constant across all R0 values
+    """
+    estimator_names = ['MLE', 'CW', 'Thompson', 'MS', 'Stein', 'PS', 'PTE']
+    
+    # ============================================================
+    # STEP 1: Generate FIXED data once for all R0 values
+    # ============================================================
+    print(f"    Generating {num_iter} fixed RSS samples for n={n}...")
+    
+    all_data_x = []
+    all_data_y = []
+    all_R_mle = []
+    all_se_R_mle = []
+    all_var_R_mle = []
+    
+    for _ in range(num_iter):
+        data_x = generate_rss(n, m, theta1)
+        data_y = generate_rss(n, m, theta2)
+        all_data_x.append(data_x)
+        all_data_y.append(data_y)
+        
+        R_mle, se_R_mle, var_R_mle = compute_R_mle_and_se(data_x, data_y, k, n_sys)
+        all_R_mle.append(R_mle)
+        all_se_R_mle.append(se_R_mle)
+        all_var_R_mle.append(var_R_mle)
+    
+    # ============================================================
+    # STEP 2: For each R0, compute estimators on the SAME data
+    # ============================================================
+    results_dict = {name: [] for name in estimator_names}
+    
+    for R0 in R0_values:
+        est_results = {name: {'R': [], 'se': []} for name in estimator_names}
+        d_star_values = []
+        
+        for i in range(num_iter):
+            R_mle = all_R_mle[i]
+            se_R_mle = all_se_R_mle[i]
+            var_R_mle = all_var_R_mle[i]
+            
+            est_vals, se_vals = bootstrap_se_fixed(
+                all_data_x[i], all_data_y[i], R0, k, n_sys, alpha,
+                n_boot, R_mle, se_R_mle, var_R_mle
+            )
+            
+            for name in estimator_names:
+                est_results[name]['R'].append(est_vals[name])
+                est_results[name]['se'].append(se_vals[name])
+            
+            est_orig = shrinkage_estimators_fixed(
+                all_data_x[i], all_data_y[i], R0, k, n_sys, alpha,
+                R_mle, se_R_mle, var_R_mle
+            )
+            d_star_values.append(est_orig['d_optimal'])
+        
+        for name in estimator_names:
+            R_vals = np.array(est_results[name]['R'])
+            se_vals = np.array(est_results[name]['se'])
+            
+            z = stats.norm.ppf(0.975)
+            lower = R_vals - z * se_vals
+            upper = R_vals + z * se_vals
+            
+            mse = np.mean((R_vals - R_true)**2)
+            bias = np.mean(R_vals - R_true)
+            var = np.var(R_vals)
+            cp = np.mean((lower <= R_true) & (R_true <= upper))
+            acil = np.mean(upper - lower)
+            
+            results_dict[name].append({
+                'R0': R0,
+                'delta': R0 - R_true,
+                'delta_abs': abs(R0 - R_true),
+                'MSE': mse,
+                'Bias': bias,
+                'Var': var,
+                'CP': cp,
+                'ACIL': acil,
+                'd_optimal_mean': np.mean(d_star_values)
+            })
+    
+    summary = []
+    for name in estimator_names:
+        for item in results_dict[name]:
+            item['Estimator'] = name
+            summary.append(item)
+    
+    df = pd.DataFrame(summary)
+    
+    mse_mle_values = df[df['Estimator'] == 'MLE'].groupby('R0')['MSE'].first()
+    
+    for idx, row in df.iterrows():
+        if row['Estimator'] != 'MLE':
+            mse_mle = mse_mle_values[row['R0']]
+            df.loc[idx, 'PI'] = (1 - row['MSE'] / mse_mle) * 100 if mse_mle > 0 else 0
+            df.loc[idx, 'RE'] = mse_mle / row['MSE'] if row['MSE'] > 0 else 1
+        else:
+            df.loc[idx, 'PI'] = 0
+            df.loc[idx, 'RE'] = 1
+    
+    df['R_true'] = R_true
+    
+    for R_true_val in df['R_true'].unique():
+        for estimator in df['Estimator'].unique():
+            mask = (df['R_true'] == R_true_val) & (df['Estimator'] == estimator)
+            if mask.any():
+                avg_cp = df.loc[mask, 'CP'].mean()
+                df.loc[mask, 'ICP'] = avg_cp
+    
+    return df
+
+
+# =======================================================
+# 3. Find theta1
+# =======================================================
+
+def find_theta1(R_target, theta2=1.0, k=2, n_sys=5):
+    def objective(theta1):
+        R_calc = calculate_R_k_n(theta1[0], theta2, k, n_sys)
+        return (R_calc - R_target)**2
+    result = minimize(objective, x0=[1.0], bounds=[(0.1, 10)])
+    return result.x[0]
+
+
+# =======================================================
+# 4. Sensitivity Analysis with FIXED DATA
+# =======================================================
+
+def run_sensitivity_analysis_fixed(
+    n=30, m=3, k=2, n_sys=5, num_iter=500, alpha=0.7,
+    R_true_values=[0.3, 0.5, 0.7],
+    delta_min=-0.35, delta_max=0.35, delta_step=0.025,
+    n_boot=200
+):
+    """Sensitivity analysis with FIXED DATA for all R0 values"""
+    all_results = []
+    theta2 = 1.0
+    
+    delta_values = np.arange(delta_min, delta_max + delta_step, delta_step)
+    delta_values = np.round(delta_values, 3)
+    
+    print("=" * 70)
+    print("Running Sensitivity Analysis (FIXED DATA)")
+    print(f"Number of iterations: {num_iter}")
+    print(f"Bootstrap per iteration: {n_boot}")
+    print(f"Number of delta steps: {len(delta_values)}")
+    print(f"Delta range: [{delta_min}, {delta_max}] with step {delta_step}")
+    print("=" * 70)
+    
+    for R_true in R_true_values:
+        theta1 = find_theta1(R_true, theta2, k, n_sys)
+        
+        print(f"\nR_true = {R_true:.2f}, theta1 = {theta1:.3f}")
+        print("-" * 50)
+        
+        R0_values = [max(0.01, min(0.99, R_true + d)) for d in delta_values]
+        
+        df_summary = simulate_scenario_fixed_data_all_R0(
+            n, m, theta1, theta2, k, n_sys, R_true,
+            R0_values, num_iter=num_iter, alpha=alpha, n_boot=n_boot
+        )
+        
+        df_summary['R_true'] = R_true
+        df_summary['theta1'] = theta1
+        df_summary['theta2'] = theta2
+        
+        all_results.append(df_summary)
+        print(f"  ✅ Completed for R_true={R_true:.2f}")
+    
+    final_df = pd.concat(all_results, ignore_index=True)
+    print("\n" + "=" * 70)
+    print("Sensitivity Analysis Complete!")
+    print("=" * 70)
+    
+    return final_df
+
+
+# =======================================================
+# 5. CORRECTED Sample Size Analysis
+# =======================================================
+
+def run_sample_size_analysis_corrected(
+    n_values=[10, 20, 30, 50, 80, 100],
+    m=3, k=2, n_sys=5, num_iter=500, alpha=0.7,
+    R_true=0.5, delta_values=[-0.2, 0.0, 0.2],
+    n_boot=200
+):
+    """
+    CORRECTED Sample size analysis - NEW DATA for each n
+    This ensures MLE improves with increasing sample size
+    """
+    theta2 = 1.0
+    theta1 = find_theta1(R_true, theta2, k, n_sys)
+    
+    print("=" * 70)
+    print("Running CORRECTED Sample Size Analysis")
+    print("NEW DATA generated for each n")
+    print(f"R_true = {R_true:.2f}, theta1 = {theta1:.3f}")
+    print(f"Sample sizes: {n_values}")
+    print("=" * 70)
+    
+    all_results = []
+    
+    for n in n_values:
+        print(f"\n  n = {n}...")
+        
+        R0_values = [max(0.01, min(0.99, R_true + d)) for d in delta_values]
+        
+        df = simulate_scenario_fixed_data_all_R0(
+            n, m, theta1, theta2, k, n_sys, R_true,
+            R0_values, num_iter=num_iter, alpha=alpha, n_boot=n_boot
+        )
+        
+        df['n'] = n
+        df['R_true'] = R_true
+        all_results.append(df)
+    
+    final_df = pd.concat(all_results, ignore_index=True)
+    print("\n" + "=" * 70)
+    print("Sample Size Analysis Complete!")
+    print("=" * 70)
+    
+    return final_df
+
+
+# =======================================================
+# 6. Plotting Functions
+# =======================================================
+
+def save_figure(fig, filename):
+    fig.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"  ✅ Saved: {filename}")
+
+
+def Figure1_MSE_vs_delta(df):
+    """Figure 1: MSE vs delta - ALL estimators"""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    estimators = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+    colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+    markers = ['o', 's', '^', 'D', 'v', 'p', '*']
+    
+    for idx, R_true in enumerate(sorted(df['R_true'].unique())):
+        ax = axes[idx]
+        df_subset = df[df['R_true'] == R_true]
+        
+        for i, est in enumerate(estimators):
+            data = df_subset[df_subset['Estimator'] == est].sort_values('delta')
+            if len(data) > 0:
+                ax.plot(data['delta'], data['MSE'], marker=markers[i], 
+                       linewidth=2, markersize=4, label=est, color=colors[i])
+        
+        # MLE should be CONSTANT - draw flat line
+        mle_data = df_subset[df_subset['Estimator'] == 'MLE']
+        if len(mle_data) > 0:
+            mle_mean = mle_data['MSE'].mean()
+            ax.axhline(y=mle_mean, color='#e74c3c', 
+                      linestyle='--', linewidth=2, alpha=0.5, label=f'MLE = {mle_mean:.5f}')
+        
+        ax.axvline(x=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax.set_xlabel(r'$\delta = R_0 - R_{true}$', fontsize=12)
+        ax.set_ylabel('MSE', fontsize=12)
+        ax.set_title(f'$R_{{true}} = {R_true:.1f}$', fontsize=13)
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(-0.37, 0.37)
+    
+    plt.suptitle('Figure 1: MSE vs $\delta$ (MLE is constant)', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    save_figure(fig, 'Figure1_MSE_vs_delta.png')
+    plt.show()
+
+
+def Figure2_CP_vs_delta(df):
+    """Figure 2: Coverage Probability vs delta - ALL estimators"""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    estimators = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+    colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+    markers = ['o', 's', '^', 'D', 'v', 'p', '*']
+    
+    for idx, R_true in enumerate(sorted(df['R_true'].unique())):
+        ax = axes[idx]
+        df_subset = df[df['R_true'] == R_true]
+        
+        for i, est in enumerate(estimators):
+            data = df_subset[df_subset['Estimator'] == est].sort_values('delta')
+            if len(data) > 0:
+                ax.plot(data['delta'], data['CP'], marker=markers[i],
+                       linewidth=2, markersize=4, label=est, color=colors[i])
+        
+        # MLE should be CONSTANT - draw flat line
+        mle_data = df_subset[df_subset['Estimator'] == 'MLE']
+        if len(mle_data) > 0:
+            mle_mean = mle_data['CP'].mean()
+            ax.axhline(y=mle_mean, color='#e74c3c', 
+                      linestyle='--', linewidth=2, alpha=0.5, label=f'MLE CP = {mle_mean:.3f}')
+        
+        ax.axhline(y=0.95, color='black', linestyle='--', linewidth=1.5, label='95% nominal')
+        ax.axvline(x=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax.set_xlabel(r'$\delta = R_0 - R_{true}$', fontsize=12)
+        ax.set_ylabel('Coverage Probability', fontsize=12)
+        ax.set_title(f'$R_{{true}} = {R_true:.1f}$', fontsize=13)
+        ax.legend(loc='lower right', fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(0.80, 1.0)
+        ax.set_xlim(-0.37, 0.37)
+    
+    plt.suptitle('Figure 2: Coverage Probability vs $\delta$ (MLE is constant)', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    save_figure(fig, 'Figure2_CP_vs_delta.png')
+    plt.show()
+
+
+def Figure3_RE_vs_delta(df):
+    """Figure 3: Relative Efficiency vs delta - ALL estimators"""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    estimators = ['Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+    colors = ['#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+    markers = ['s', '^', 'D', 'v', 'p', '*']
+    
+    for idx, R_true in enumerate(sorted(df['R_true'].unique())):
+        ax = axes[idx]
+        df_subset = df[df['R_true'] == R_true]
+        
+        for i, est in enumerate(estimators):
+            data = df_subset[df_subset['Estimator'] == est].sort_values('delta')
+            if len(data) > 0:
+                ax.plot(data['delta'], data['RE'], marker=markers[i],
+                       linewidth=2, markersize=4, label=est, color=colors[i])
+        
+        ax.axhline(y=1, color='red', linestyle='--', linewidth=2, alpha=0.7, label='MLE = 1')
+        ax.axvline(x=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax.set_xlabel(r'$\delta = R_0 - R_{true}$', fontsize=12)
+        ax.set_ylabel('Relative Efficiency (RE)', fontsize=12)
+        ax.set_title(f'$R_{{true}} = {R_true:.1f}$', fontsize=13)
+        ax.legend(loc='upper right', fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(-0.37, 0.37)
+        
+        y_max = max(5, ax.get_ylim()[1])
+        ax.set_ylim(0, y_max)
+    
+    plt.suptitle('Figure 3: Relative Efficiency (RE) vs $\delta$', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    save_figure(fig, 'Figure3_RE_vs_delta.png')
+    plt.show()
+
+
+def Figure4_Heatmap_MSE_extended(df):
+    """Figure 4: Heatmap of MSE Ratio to MLE - Extended with more delta values"""
+    fig, ax = plt.subplots(figsize=(16, 12))
+    cols = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+    
+    extended_deltas = np.round(np.arange(-0.35, 0.36, 0.05), 2)
+    df_extended = df[np.isin(np.round(df['delta'], 2), extended_deltas)]
+    df_extended['label'] = df_extended.apply(
+        lambda x: f"R={x['R_true']:.1f}, δ={x['delta']:+.2f}", axis=1
+    )
+    df_extended = df_extended.sort_values(['R_true', 'delta'])
+    
+    pivot = df_extended.pivot_table(index='label', columns='Estimator', values='MSE')
+    if 'MLE' in pivot.columns:
+        pivot_norm = pivot.div(pivot['MLE'] + 1e-10, axis=0)
+    else:
+        pivot_norm = pivot
+    
+    available_cols = [c for c in cols if c in pivot_norm.columns]
+    pivot_norm = pivot_norm[available_cols]
+    
+    sns.heatmap(pivot_norm, annot=True, fmt='.2f', cmap='RdYlGn_r',
+                ax=ax, cbar_kws={'label': 'MSE / MSE_MLE'},
+                linewidths=0.5, linecolor='white')
+    ax.set_title('Figure 4: Extended Heatmap of MSE Ratio to MLE', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Estimator', fontsize=11)
+    ax.set_ylabel('(R_true, δ)', fontsize=11)
+    
+    plt.tight_layout()
+    save_figure(fig, 'Figure4_Heatmap_MSE_extended.png')
+    plt.show()
+
+
+def Figure5_Heatmap_CP_extended(df):
+    """Figure 5: Extended Heatmap of Coverage Probability (CP)"""
+    fig, ax = plt.subplots(figsize=(16, 12))
+    cols = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+    
+    extended_deltas = np.round(np.arange(-0.35, 0.36, 0.05), 2)
+    df_extended = df[np.isin(np.round(df['delta'], 2), extended_deltas)]
+    df_extended['label'] = df_extended.apply(
+        lambda x: f"R={x['R_true']:.1f}, δ={x['delta']:+.2f}", axis=1
+    )
+    df_extended = df_extended.sort_values(['R_true', 'delta'])
+    
+    pivot = df_extended.pivot_table(index='label', columns='Estimator', values='CP')
+    available_cols = [c for c in cols if c in pivot.columns]
+    pivot = pivot[available_cols]
+    
+    sns.heatmap(pivot, annot=True, fmt='.3f', cmap='RdBu_r',
+                ax=ax, cbar_kws={'label': 'Coverage Probability'},
+                linewidths=0.5, linecolor='white')
+    ax.set_title('Figure 5: Extended Heatmap of Coverage Probability (CP)', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Estimator', fontsize=11)
+    ax.set_ylabel('(R_true, δ)', fontsize=11)
+    
+    plt.tight_layout()
+    save_figure(fig, 'Figure5_Heatmap_CP_extended.png')
+    plt.show()
+
+
+def Figure6_Heatmap_ACIL_extended(df):
+    """Figure 6: Extended Heatmap of ACIL"""
+    fig, ax = plt.subplots(figsize=(16, 12))
+    cols = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+    
+    extended_deltas = np.round(np.arange(-0.35, 0.36, 0.05), 2)
+    df_extended = df[np.isin(np.round(df['delta'], 2), extended_deltas)]
+    df_extended['label'] = df_extended.apply(
+        lambda x: f"R={x['R_true']:.1f}, δ={x['delta']:+.2f}", axis=1
+    )
+    df_extended = df_extended.sort_values(['R_true', 'delta'])
+    
+    pivot = df_extended.pivot_table(index='label', columns='Estimator', values='ACIL')
+    available_cols = [c for c in cols if c in pivot.columns]
+    pivot = pivot[available_cols]
+    
+    sns.heatmap(pivot, annot=True, fmt='.3f', cmap='YlOrRd',
+                ax=ax, cbar_kws={'label': 'ACIL'},
+                linewidths=0.5, linecolor='white')
+    ax.set_title('Figure 6: Extended Heatmap of ACIL', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Estimator', fontsize=11)
+    ax.set_ylabel('(R_true, δ)', fontsize=11)
+    
+    plt.tight_layout()
+    save_figure(fig, 'Figure6_Heatmap_ACIL_extended.png')
+    plt.show()
+
+
+def Figure7_Bar_Best_Worst(df):
+    """Figure 7: Bar plot - Best vs Worst MSE"""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    estimators = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+    colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+    
+    for idx, R_true in enumerate(sorted(df['R_true'].unique())):
+        ax = axes[idx]
+        df_subset = df[df['R_true'] == R_true]
+        
+        best_data = df_subset[np.abs(df_subset['delta']) < 0.005]
+        worst_data = df_subset[df_subset['delta_abs'] == df_subset['delta_abs'].max()]
+        
+        x = np.arange(len(estimators))
+        width = 0.35
+        
+        best_mse = []
+        worst_mse = []
+        
+        for est in estimators:
+            best_val = best_data[best_data['Estimator'] == est]['MSE'].values
+            worst_val = worst_data[worst_data['Estimator'] == est]['MSE'].values
+            best_mse.append(best_val[0] if len(best_val) > 0 else 0)
+            worst_mse.append(worst_val[0] if len(worst_val) > 0 else 0)
+        
+        bars1 = ax.bar(x - width/2, best_mse, width, label='Best (δ ≈ 0)', 
+                       color='#2ecc71', edgecolor='darkgreen', linewidth=1.5)
+        bars2 = ax.bar(x + width/2, worst_mse, width, label='Worst (δ = max)', 
+                       color='#e74c3c', edgecolor='darkred', linewidth=1.5)
+        
+        for bar in bars1:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width()/2, height),
+                       xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=7)
+        for bar in bars2:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width()/2, height),
+                       xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=7)
+        
+        ax.set_xlabel('Estimator', fontsize=11)
+        ax.set_ylabel('MSE', fontsize=11)
+        ax.set_title(f'$R_{{true}} = {R_true:.1f}$', fontsize=13)
+        ax.set_xticks(x)
+        ax.set_xticklabels(estimators, rotation=45, ha='right', fontsize=8)
+        ax.legend(loc='upper left', fontsize=8)
+        ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.suptitle('Figure 7: MSE: Best vs Worst Cases', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    save_figure(fig, 'Figure7_Bar_Best_Worst.png')
+    plt.show()
+
+
+def Figure8_Sample_Size_MSE_corrected(df):
+    """Figure 8: CORRECTED Sample Size Analysis - MSE (new data for each n)"""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    estimators = ['MLE', 'Stein', 'PS', 'PTE', 'CW']
+    colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6']
+    markers = ['o', 's', '^', 'D', 'v']
+    
+    for i, est in enumerate(estimators):
+        data = df[df['Estimator'] == est]
+        if len(data) > 0:
+            # Only use delta ≈ 0 for best case comparison
+            data_best = data[np.abs(data['delta']) < 0.005]
+            if len(data_best) > 0:
+                summary = data_best.groupby('n').agg({'MSE': ['mean', 'std']}).reset_index()
+                summary.columns = ['n', 'MSE_mean', 'MSE_std']
+                
+                ax.plot(summary['n'], summary['MSE_mean'], marker=markers[i],
+                       linewidth=2, markersize=7, label=est, color=colors[i])
+                ax.fill_between(summary['n'], 
+                               summary['MSE_mean'] - summary['MSE_std'], 
+                               summary['MSE_mean'] + summary['MSE_std'],
+                               alpha=0.15, color=colors[i])
+    
+    ax.set_xlabel('Sample Size (n)', fontsize=12)
+    ax.set_ylabel('MSE', fontsize=12)
+    ax.set_title('Figure 8: MSE vs Sample Size (δ ≈ 0, Corrected)', fontsize=13)
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max(df['n']) + 5)
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.1)
+    
+    plt.tight_layout()
+    save_figure(fig, 'Figure8_Sample_Size_MSE_corrected.png')
+    plt.show()
+
+
+def Figure9_Sample_Size_CP_corrected(df):
+    """Figure 9: CORRECTED Sample Size Analysis - CP (new data for each n)"""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    estimators = ['MLE', 'Stein', 'PS', 'PTE']
+    colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12']
+    markers = ['o', 's', '^', 'D']
+    
+    for i, est in enumerate(estimators):
+        data = df[df['Estimator'] == est]
+        if len(data) > 0:
+            # Only use delta ≈ 0 for best case comparison
+            data_best = data[np.abs(data['delta']) < 0.005]
+            if len(data_best) > 0:
+                summary = data_best.groupby('n').agg({'CP': ['mean', 'std']}).reset_index()
+                summary.columns = ['n', 'CP_mean', 'CP_std']
+                
+                ax.plot(summary['n'], summary['CP_mean'], marker=markers[i],
+                       linewidth=2, markersize=7, label=est, color=colors[i])
+                ax.fill_between(summary['n'], 
+                               summary['CP_mean'] - summary['CP_std'], 
+                               summary['CP_mean'] + summary['CP_std'],
+                               alpha=0.15, color=colors[i])
+    
+    ax.axhline(y=0.95, color='red', linestyle='--', linewidth=1.5, label='95% nominal')
+    ax.set_xlabel('Sample Size (n)', fontsize=12)
+    ax.set_ylabel('Coverage Probability', fontsize=12)
+    ax.set_title('Figure 9: CP vs Sample Size (δ ≈ 0, Corrected)', fontsize=13)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max(df['n']) + 5)
+    ax.set_ylim(0.85, 1.0)
+    
+    plt.tight_layout()
+    save_figure(fig, 'Figure9_Sample_Size_CP_corrected.png')
+    plt.show()
+
+
+def Figure10_Sample_Size_PI_corrected(df):
+    """Figure 10: CORRECTED Sample Size Analysis - PI (new data for each n)"""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    estimators = ['Stein', 'PS', 'PTE', 'CW']
+    colors = ['#2ecc71', '#3498db', '#f39c12', '#9b59b6']
+    markers = ['s', '^', 'D', 'v']
+    
+    for i, est in enumerate(estimators):
+        data = df[df['Estimator'] == est]
+        if len(data) > 0:
+            # Only use delta ≈ 0 for best case comparison
+            data_best = data[np.abs(data['delta']) < 0.005]
+            if len(data_best) > 0:
+                summary = data_best.groupby('n').agg({'PI': ['mean', 'std']}).reset_index()
+                summary.columns = ['n', 'PI_mean', 'PI_std']
+                
+                ax.plot(summary['n'], summary['PI_mean'], marker=markers[i],
+                       linewidth=2, markersize=7, label=est, color=colors[i])
+                ax.fill_between(summary['n'], 
+                               summary['PI_mean'] - summary['PI_std'], 
+                               summary['PI_mean'] + summary['PI_std'],
+                               alpha=0.15, color=colors[i])
+    
+    ax.axhline(y=0, color='red', linestyle='--', linewidth=1, alpha=0.5)
+    ax.set_xlabel('Sample Size (n)', fontsize=12)
+    ax.set_ylabel('Percentage Improvement (%)', fontsize=12)
+    ax.set_title('Figure 10: PI vs Sample Size (δ ≈ 0, Corrected)', fontsize=13)
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max(df['n']) + 5)
+    
+    plt.tight_layout()
+    save_figure(fig, 'Figure10_Sample_Size_PI_corrected.png')
+    plt.show()
+
+
+# =======================================================
+# 7. Tables
+# =======================================================
+
+def generate_tables(df):
+    """Generate tables without RE estimator"""
+    
+    print("\n" + "=" * 70)
+    print("TABLE 1: Best Case (δ ≈ 0)")
+    print("=" * 70)
+    
+    best_data = df[np.abs(df['delta']) < 0.005]
+    if len(best_data) > 0:
+        table1 = best_data.groupby('Estimator').agg({
+            'MSE': 'mean', 'Bias': 'mean', 'CP': 'mean', 
+            'ACIL': 'mean', 'PI': 'mean', 'RE': 'mean'
+        }).round(4)
+        print(table1)
+        table1.to_csv('Table1_Best_Case.csv')
+    
+    print("\n" + "=" * 70)
+    print("TABLE 2: Worst Case (|δ| = max)")
+    print("=" * 70)
+    
+    worst_data = df[df['delta_abs'] == df['delta_abs'].max()]
+    if len(worst_data) > 0:
+        table2 = worst_data.groupby('Estimator').agg({
+            'MSE': 'mean', 'Bias': 'mean', 'CP': 'mean', 
+            'ACIL': 'mean', 'PI': 'mean', 'RE': 'mean'
+        }).round(4)
+        print(table2)
+        table2.to_csv('Table2_Worst_Case.csv')
+    
+    print("\n" + "=" * 70)
+    print("TABLE 3: ICP (Integrated Coverage Probability)")
+    print("=" * 70)
+    
+    icp_table = df.groupby(['R_true', 'Estimator']).agg({'ICP': 'first'}).round(4)
+    icp_pivot = icp_table.unstack()
+    print(icp_pivot)
+    icp_pivot.to_csv('Table3_ICP.csv')
+
+
+# =======================================================
+# 8. Main Execution
+# =======================================================
+
+def main():
+    print("=" * 70)
+    print("STARTING FINAL COMPREHENSIVE ANALYSIS")
+    print("FIXED DATA for all R0 values (MLE is constant)")
+    print("CORRECTED Sample Size Analysis (new data for each n)")
+    print("=" * 70)
+
+    # Verify the corrected closed-form R_{k:n} formula (eq. Rkn_exp in the
+    # revised paper) against the general Beta-function form before running
+    # any simulation, so a regression here fails loudly and immediately.
+    max_diff = _self_check_R_k_n()
+    print(f"Closed-form vs Beta-form self-check passed (max diff = {max_diff:.2e})")
+    print("=" * 70)
+    
+    # Part 1: Sensitivity Analysis
+    print("\n" + "=" * 70)
+    print("PART 1: Sensitivity Analysis")
+    print("=" * 70)
+    
+    sensitivity_df = run_sensitivity_analysis_fixed(
+        n=30, m=3, k=2, n_sys=5,
+        num_iter=500,
+        alpha=0.7,
+        R_true_values=[0.3, 0.5, 0.7],
+        delta_min=-0.35,
+        delta_max=0.35,
+        delta_step=0.025,
+        # Raised from 50 -> 200 per the paper's revised note that B=50 is
+        # below the B>=1000 typically recommended for percentile bootstrap
+        # CIs (Efron & Tibshirani, 1993). 200 is a practical compromise given
+        # this is a NESTED bootstrap (run inside 500 x 29 x 3 outer Monte
+        # Carlo iterations); set N_BOOT_FULL below and use it here if you can
+        # afford the ~5x longer runtime for a final, publication-grade run.
+        n_boot=200
+    )
+    sensitivity_df.to_csv('sensitivity_analysis_final.csv', index=False)
+    
+    # Part 2: CORRECTED Sample Size Analysis
+    print("\n" + "=" * 70)
+    print("PART 2: CORRECTED Sample Size Analysis")
+    print("(NEW DATA for each n)")
+    print("=" * 70)
+    
+    sample_size_df = run_sample_size_analysis_corrected(
+        n_values=[10, 20, 30, 50, 80, 100],
+        m=3, k=2, n_sys=5,
+        num_iter=500,
+        alpha=0.7,
+        R_true=0.5,
+        delta_values=[-0.2, 0.0, 0.2],
+        n_boot=200
+    )
+    sample_size_df.to_csv('sample_size_analysis_corrected.csv', index=False)
+    
+    # Part 3: Generate Figures
+    print("\n" + "=" * 70)
+    print("PART 3: Generating Figures")
+    print("=" * 70)
+    
+    Figure1_MSE_vs_delta(sensitivity_df)
+    Figure2_CP_vs_delta(sensitivity_df)
+    Figure3_RE_vs_delta(sensitivity_df)
+    Figure4_Heatmap_MSE_extended(sensitivity_df)
+    Figure5_Heatmap_CP_extended(sensitivity_df)
+    Figure6_Heatmap_ACIL_extended(sensitivity_df)
+    Figure7_Bar_Best_Worst(sensitivity_df)
+    Figure8_Sample_Size_MSE_corrected(sample_size_df)
+    Figure9_Sample_Size_CP_corrected(sample_size_df)
+    Figure10_Sample_Size_PI_corrected(sample_size_df)
+    
+    # Part 4: Generate Tables
+    print("\n" + "=" * 70)
+    print("PART 4: Generating Tables")
+    print("=" * 70)
+    
+    generate_tables(sensitivity_df)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("✅ ANALYSIS COMPLETE!")
+    print("=" * 70)
+    print("\nGenerated Files:")
+    print("  📊 10 Figures (PNG format)")
+    print("  📄 3 Tables (CSV format)")
+    print("  📄 sensitivity_analysis_final.csv")
+    print("  📄 sample_size_analysis_corrected.csv")
+    print("=" * 70)
+    
+    return sensitivity_df, sample_size_df
+
+
+# =======================================================
+# Run
+# =======================================================
+if __name__ == "__main__":
+    sensitivity_results, sample_size_results = main()
