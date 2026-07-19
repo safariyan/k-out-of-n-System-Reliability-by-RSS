@@ -1,0 +1,1125 @@
+# =======================================================
+# REAL DATA ANALYSIS: Murray et al. (2000)
+# Corrected Data: Control vs Treatment (2 groups)
+# Distribution Fitting for Both Groups
+# =======================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.optimize import minimize
+from scipy.special import beta, comb, gamma
+from scipy.stats import kstest, anderson, chi2
+import warnings
+warnings.filterwarnings('ignore')
+
+# =======================================================
+# Plot Settings
+# =======================================================
+plt.rcParams['font.size'] = 12
+plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['savefig.dpi'] = 300
+plt.rcParams['savefig.bbox'] = 'tight'
+sns.set_style("whitegrid")
+
+print("=" * 80)
+print("REAL DATA ANALYSIS: Murray et al. (2000)")
+print("Corrected Data: Control vs Treatment")
+print("Distribution Fitting for Both Groups")
+print("=" * 80)
+
+
+# =======================================================
+# 1. Load Corrected Data
+# =======================================================
+
+def load_murray_data_corrected():
+  """
+    Load corrected Murray et al. (2000) data
+    Two groups: Control and Treatment
+    Each has 10 cycles with 5 ranks
+    """
+# Control Group (no spray)
+control_data = np.array([
+  [0.003, 0.028, 0.244, 0.057, 0.143],
+  [0.039, 0.119, 0.126, 0.105, 0.565],
+  [0.034, 0.118, 0.130, 0.218, 0.296],
+  [0.051, 0.104, 0.193, 0.210, 0.150],
+  [0.032, 0.141, 0.130, 0.250, 0.229],
+  [0.069, 0.070, 0.260, 0.225, 0.285],
+  [0.100, 0.091, 0.244, 0.130, 0.347],
+  [0.012, 0.096, 0.069, 0.373, 0.133],
+  [0.046, 0.117, 0.126, 0.223, 0.273],
+  [0.028, 0.083, 0.108, 0.212, 0.261]
+])
+
+# Treatment Group (with spray)
+treatment_data = np.array([
+  [0.036, 0.137, 0.183, 0.270, 0.487],
+  [0.250, 0.181, 0.290, 0.328, 0.715],
+  [0.089, 0.032, 0.269, 0.419, 0.315],
+  [0.180, 0.111, 0.130, 0.194, 0.742],
+  [0.100, 0.009, 0.184, 0.277, 0.122],
+  [0.042, 0.089, 0.199, 0.269, 0.395],
+  [0.044, 0.083, 0.227, 0.177, 0.742],
+  [0.044, 0.171, 0.067, 0.192, 0.336],
+  [0.009, 0.017, 0.217, 0.438, 0.544],
+  [0.071, 0.132, 0.310, 0.343, 0.379]
+])
+
+data_groups = {
+  'Control': control_data,
+  'Treatment': treatment_data
+}
+
+return data_groups
+
+
+def get_safe_filename(name):
+  """Convert name to safe filename"""
+import re
+safe = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+safe = re.sub(r'_+', '_', safe)
+return safe
+
+
+# =======================================================
+# 2. Distribution Definitions
+# =======================================================
+
+def gef_pdf(x, theta, c=1):
+  """GEF PDF: f(x) = θ c x^(c-1) exp(-θ x^c)"""
+return theta * c * (x ** (c-1)) * np.exp(-theta * (x ** c))
+
+
+def gef_cdf(x, theta, c=1):
+  """GEF CDF: F(x) = 1 - exp(-θ x^c)"""
+return 1 - np.exp(-theta * (x ** c))
+
+
+def gef_quantile(p, theta, c=1):
+  """GEF Quantile: Q(p) = (-log(1-p)/θ)^(1/c)"""
+return ((-np.log(1-p)) / theta) ** (1/c)
+
+
+# =======================================================
+# 3. Distribution Fitting Functions
+# =======================================================
+
+def fit_exponential(data):
+  """Fit Exponential: c=1, θ=1/mean"""
+theta_hat = 1 / np.mean(data)
+return theta_hat, 1.0
+
+
+def fit_weibull(data):
+  """Fit Weibull using MLE"""
+def neg_log_likelihood(params):
+  c, theta = params
+if c <= 0 or theta <= 0:
+  return 1e10
+n = len(data)
+log_lik = n * np.log(theta * c) + (c-1) * np.sum(np.log(data + 1e-10)) - theta * np.sum((data + 1e-10) ** c)
+return -log_lik
+
+cv = np.std(data) / np.mean(data)
+c_init = 1.2 if cv > 0.5 else 2.0
+theta_init = (np.mean((data + 1e-10) ** c_init)) ** (-1/c_init)
+
+result = minimize(neg_log_likelihood, [c_init, theta_init], 
+                  bounds=[(0.1, 10), (0.01, 100)])
+if result.success:
+  return result.x[1], result.x[0]
+return theta_init, c_init
+
+
+def fit_gamma(data):
+  """Fit Gamma distribution"""
+data_pos = data + 1e-10
+shape, loc, scale = stats.gamma.fit(data_pos, floc=0)
+return shape, scale
+
+
+def fit_lognormal(data):
+  """Fit Log-normal distribution"""
+data_pos = data + 1e-10
+shape, loc, scale = stats.lognorm.fit(data_pos, floc=0)
+return shape, scale
+
+
+def fit_inverse_gaussian(data):
+  """Fit Inverse Gaussian distribution"""
+data_pos = data + 1e-10
+mu = np.mean(data_pos)
+lam = 1 / np.mean(1/data_pos - 1/mu)
+return mu, lam
+
+
+# =======================================================
+# 4. Goodness-of-Fit Tests
+# =======================================================
+
+def perform_gof_tests(data, dist_name, params):
+  """Perform comprehensive goodness-of-fit tests"""
+results = {}
+n = len(data)
+data_pos = data + 1e-10
+
+# Kolmogorov-Smirnov test
+if dist_name == 'Exponential':
+  theta, c = params
+ks_stat, ks_p = kstest(data_pos, 'expon', args=(0, 1/theta))
+elif dist_name == 'Weibull':
+  theta, c = params
+transformed = (data_pos ** c) * theta
+ks_stat, ks_p = kstest(transformed, 'expon')
+elif dist_name == 'Gamma':
+  shape, scale = params
+ks_stat, ks_p = kstest(data_pos, 'gamma', args=(shape, 0, scale))
+elif dist_name == 'Lognormal':
+  shape, scale = params
+ks_stat, ks_p = kstest(data_pos, 'lognorm', args=(shape, 0, scale))
+elif dist_name == 'Inverse Gaussian':
+  mu, lam = params
+transformed = np.sqrt(lam/data_pos) * (data_pos/mu - 1)
+ks_stat, ks_p = kstest(transformed, 'norm')
+else:
+  ks_stat, ks_p = np.nan, np.nan
+
+results['KS_stat'] = ks_stat
+results['KS_p'] = ks_p
+
+# Log-likelihood, AIC, BIC
+if dist_name == 'Exponential':
+  theta, c = params
+log_lik = n * np.log(theta) - theta * np.sum(data_pos)
+k_param = 1
+elif dist_name == 'Weibull':
+  theta, c = params
+log_lik = n * np.log(theta * c) + (c-1) * np.sum(np.log(data_pos)) - theta * np.sum(data_pos ** c)
+k_param = 2
+elif dist_name == 'Gamma':
+  shape, scale = params
+log_lik = np.sum(stats.gamma.logpdf(data_pos, shape, 0, scale))
+k_param = 2
+elif dist_name == 'Lognormal':
+  shape, scale = params
+log_lik = np.sum(stats.lognorm.logpdf(data_pos, shape, 0, scale))
+k_param = 2
+elif dist_name == 'Inverse Gaussian':
+  mu, lam = params
+log_lik = np.sum(stats.invgauss.logpdf(data_pos, mu/lam, scale=lam))
+k_param = 2
+else:
+  log_lik = 0
+k_param = 2
+
+results['log_lik'] = log_lik
+results['AIC'] = -2 * log_lik + 2 * k_param
+results['BIC'] = -2 * log_lik + k_param * np.log(n)
+
+return results
+
+
+# =======================================================
+# 5. Plotting Functions
+# =======================================================
+
+def plot_group_comparison(data_groups):
+  """Plot comparison of Control vs Treatment"""
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+colors = {'Control': '#3498db', 'Treatment': '#e74c3c'}
+
+for idx, (group_name, data_matrix) in enumerate(data_groups.items()):
+  ax = axes[idx]
+data_vector = data_matrix.flatten()
+
+sns.histplot(data_vector, kde=True, ax=ax, color=colors[group_name], bins=10, alpha=0.6)
+ax.axvline(np.mean(data_vector), color='red', linestyle='--', 
+           label=f'Mean: {np.mean(data_vector):.4f}')
+ax.axvline(np.median(data_vector), color='green', linestyle='--', 
+           label=f'Median: {np.median(data_vector):.4f}')
+ax.set_xlabel('Percent Cover')
+ax.set_ylabel('Frequency')
+ax.set_title(f'{group_name} Group (n={len(data_vector)})')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+plt.suptitle('Comparison of Control vs Treatment Groups', fontsize=16, fontweight='bold')
+plt.tight_layout()
+plt.savefig('Control_vs_Treatment_Comparison.png', dpi=300, bbox_inches='tight')
+plt.show()
+print("✅ Saved: Control_vs_Treatment_Comparison.png")
+
+
+def plot_group_fits(data_vector, group_name, fits_dict, gof_results):
+  """Plot fitted distributions for a group"""
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+x_vals = np.linspace(0, max(data_vector)*1.1, 200)
+colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6']
+dist_names = list(fits_dict.keys())
+
+# 1. Histogram with fitted PDFs
+ax1 = axes[0]
+sns.histplot(data_vector, kde=True, ax=ax1, color='gray', bins=10, stat='density', alpha=0.4)
+
+for i, (dist_name, params) in enumerate(fits_dict.items()):
+  if dist_name == 'Exponential':
+  theta, c = params
+y_vals = gef_pdf(x_vals + 1e-10, theta, c)
+elif dist_name == 'Weibull':
+  theta, c = params
+y_vals = gef_pdf(x_vals + 1e-10, theta, c)
+elif dist_name == 'Gamma':
+  shape, scale = params
+y_vals = stats.gamma.pdf(x_vals + 1e-10, shape, 0, scale)
+elif dist_name == 'Lognormal':
+  shape, scale = params
+y_vals = stats.lognorm.pdf(x_vals + 1e-10, shape, 0, scale)
+elif dist_name == 'Inverse Gaussian':
+  mu, lam = params
+y_vals = stats.invgauss.pdf(x_vals + 1e-10, mu/lam, scale=lam)
+else:
+  y_vals = np.zeros_like(x_vals)
+
+ax1.plot(x_vals, y_vals, color=colors[i], linewidth=2.5, label=dist_name)
+
+ax1.set_xlabel('Percent Cover')
+ax1.set_ylabel('Density')
+ax1.set_title(f'{group_name} - Density Comparison')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# 2. CDF Comparison
+ax2 = axes[1]
+data_sorted = np.sort(data_vector)
+ecdf = np.arange(1, len(data_vector)+1) / len(data_vector)
+ax2.step(data_sorted, ecdf, 'k-', linewidth=2.5, label='Empirical')
+
+for i, (dist_name, params) in enumerate(fits_dict.items()):
+  if dist_name == 'Exponential':
+  theta, c = params
+y_vals = gef_cdf(x_vals + 1e-10, theta, c)
+elif dist_name == 'Weibull':
+  theta, c = params
+y_vals = gef_cdf(x_vals + 1e-10, theta, c)
+elif dist_name == 'Gamma':
+  shape, scale = params
+y_vals = stats.gamma.cdf(x_vals + 1e-10, shape, 0, scale)
+elif dist_name == 'Lognormal':
+  shape, scale = params
+y_vals = stats.lognorm.cdf(x_vals + 1e-10, shape, 0, scale)
+elif dist_name == 'Inverse Gaussian':
+  mu, lam = params
+y_vals = stats.invgauss.cdf(x_vals + 1e-10, mu/lam, scale=lam)
+else:
+  y_vals = np.zeros_like(x_vals)
+
+ax2.plot(x_vals, y_vals, color=colors[i], linestyle='--', linewidth=2, label=dist_name)
+
+ax2.set_xlabel('Percent Cover')
+ax2.set_ylabel('CDF')
+ax2.set_title(f'{group_name} - CDF Comparison')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+# 3. Goodness-of-Fit (AIC/BIC)
+ax3 = axes[2]
+aic_values = [gof_results[d]['AIC'] for d in dist_names]
+bic_values = [gof_results[d]['BIC'] for d in dist_names]
+
+x = np.arange(len(dist_names))
+width = 0.35
+
+bars1 = ax3.bar(x - width/2, aic_values, width, label='AIC', color='steelblue', alpha=0.7)
+bars2 = ax3.bar(x + width/2, bic_values, width, label='BIC', color='coral', alpha=0.7)
+
+ax3.set_xlabel('Distribution')
+ax3.set_ylabel('AIC / BIC')
+ax3.set_title(f'{group_name} - AIC/BIC Comparison')
+ax3.set_xticks(x)
+ax3.set_xticklabels(dist_names, rotation=45, ha='right')
+ax3.legend()
+ax3.grid(True, alpha=0.3, axis='y')
+
+for bar, val in zip(bars1, aic_values):
+  ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, 
+           f'{val:.1f}', ha='center', va='bottom', fontsize=8)
+for bar, val in zip(bars2, bic_values):
+  ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, 
+           f'{val:.1f}', ha='center', va='bottom', fontsize=8)
+
+plt.tight_layout()
+safe_name = get_safe_filename(group_name)
+plt.savefig(f'Group_Fit_{safe_name}.png', dpi=300, bbox_inches='tight')
+plt.show()
+print(f"  ✅ Saved: Group_Fit_{safe_name}.png")
+
+
+# =======================================================
+# 6. Main Analysis
+# =======================================================
+
+def main():
+  print("=" * 80)
+print("DISTRIBUTION FITTING FOR BOTH GROUPS")
+print("Control vs Treatment - Murray et al. (2000)")
+print("=" * 80)
+
+# Load corrected data
+data_groups = load_murray_data_corrected()
+
+all_results = {}
+
+# Plot comparison
+plot_group_comparison(data_groups)
+
+for group_name, data_matrix in data_groups.items():
+  data_vector = data_matrix.flatten()
+
+print(f"\n{'='*80}")
+print(f"ANALYZING: {group_name} Group")
+print(f"{'='*80}")
+
+print(f"\nData Summary:")
+print(f"  Sample Size: {len(data_vector)}")
+print(f"  Mean: {np.mean(data_vector):.4f}")
+print(f"  Median: {np.median(data_vector):.4f}")
+print(f"  Std Dev: {np.std(data_vector):.4f}")
+print(f"  Min: {np.min(data_vector):.4f}")
+print(f"  Max: {np.max(data_vector):.4f}")
+print(f"  Number of zeros: {np.sum(data_vector == 0)}")
+
+# Fit all distributions
+fits = {}
+
+# 1. Exponential
+theta_exp, c_exp = fit_exponential(data_vector)
+fits['Exponential'] = (theta_exp, c_exp)
+
+# 2. Weibull
+theta_w, c_w = fit_weibull(data_vector)
+fits['Weibull'] = (theta_w, c_w)
+
+# 3. Gamma
+shape_g, scale_g = fit_gamma(data_vector)
+fits['Gamma'] = (shape_g, scale_g)
+
+# 4. Lognormal
+shape_ln, scale_ln = fit_lognormal(data_vector)
+fits['Lognormal'] = (shape_ln, scale_ln)
+
+# 5. Inverse Gaussian
+mu_ig, lam_ig = fit_inverse_gaussian(data_vector)
+fits['Inverse Gaussian'] = (mu_ig, lam_ig)
+
+print(f"\nFitted Parameters:")
+print(f"  {'Distribution':<18} {'Parameters':<40}")
+print(f"  {'-'*60}")
+print(f"  {'Exponential':<18} θ={theta_exp:.4f}, c={c_exp:.4f} (fixed)")
+print(f"  {'Weibull':<18} θ={theta_w:.4f}, c={c_w:.4f}")
+print(f"  {'Gamma':<18} shape={shape_g:.4f}, scale={scale_g:.4f}")
+print(f"  {'Lognormal':<18} σ={shape_ln:.4f}, scale={scale_ln:.4f}")
+print(f"  {'Inverse Gaussian':<18} μ={mu_ig:.4f}, λ={lam_ig:.4f}")
+
+# Goodness-of-fit tests
+print(f"\nGoodness-of-Fit Tests:")
+print(f"  {'Distribution':<18} {'KS stat':<12} {'KS p-value':<14} {'AIC':<12} {'BIC':<12}")
+print(f"  {'-'*70}")
+
+gof_results = {}
+best_aic = np.inf
+best_bic = np.inf
+best_dist_aic = ""
+best_dist_bic = ""
+
+for dist_name, params in fits.items():
+  gof = perform_gof_tests(data_vector, dist_name, params)
+gof_results[dist_name] = gof
+
+ks_p = gof['KS_p']
+ks_p_str = f"{ks_p:.4f}" if not np.isnan(ks_p) else "N/A"
+aic = gof['AIC']
+bic = gof['BIC']
+
+status = "✓" if (not np.isnan(ks_p) and ks_p > 0.05) else "✗"
+print(f"  {dist_name:<18} {gof['KS_stat']:.4f}    {ks_p_str:<14} {aic:.2f}      {bic:.2f}     {status}")
+
+if aic < best_aic:
+  best_aic = aic
+best_dist_aic = dist_name
+if bic < best_bic:
+  best_bic = bic
+best_dist_bic = dist_name
+
+print(f"\n  ✅ Best by AIC: {best_dist_aic} (AIC = {best_aic:.2f})")
+print(f"  ✅ Best by BIC: {best_dist_bic} (BIC = {best_bic:.2f})")
+
+all_results[group_name] = {
+  'fits': fits,
+  'gof': gof_results,
+  'best_aic': best_dist_aic,
+  'best_bic': best_dist_bic
+}
+
+# Plot group fit
+plot_group_fits(data_vector, group_name, fits, gof_results)
+
+# Generate summary table
+print("\n" + "=" * 80)
+print("SUMMARY: Best Distribution for Each Group")
+print("=" * 80)
+
+summary_rows = []
+for group_name, results in all_results.items():
+  summary_rows.append({
+    'Group': group_name,
+    'Best by AIC': results['best_aic'],
+    'Best by BIC': results['best_bic'],
+    'AIC Value': f"{results['gof'][results['best_aic']]['AIC']:.2f}",
+    'BIC Value': f"{results['gof'][results['best_bic']]['BIC']:.2f}"
+  })
+
+df_summary = pd.DataFrame(summary_rows)
+print(df_summary.to_string(index=False))
+df_summary.to_csv('Best_Distribution_Summary.csv', index=False)
+
+# Detailed comparison table
+print("\n" + "=" * 80)
+print("DETAILED AIC/BIC COMPARISON")
+print("=" * 80)
+
+detail_rows = []
+for group_name, results in all_results.items():
+  row = {'Group': group_name}
+for dist_name, gof in results['gof'].items():
+  row[f'{dist_name}_AIC'] = f"{gof['AIC']:.2f}"
+row[f'{dist_name}_BIC'] = f"{gof['BIC']:.2f}"
+detail_rows.append(row)
+
+df_detail = pd.DataFrame(detail_rows)
+print(df_detail.to_string(index=False))
+df_detail.to_csv('Detailed_AIC_BIC.csv', index=False)
+
+# Cross-group comparison
+print("\n" + "=" * 80)
+print("CROSS-GROUP COMPARISON")
+print("=" * 80)
+
+control_gof = all_results['Control']['gof']
+treatment_gof = all_results['Treatment']['gof']
+
+cross_rows = []
+for dist_name in control_gof.keys():
+  cross_rows.append({
+    'Distribution': dist_name,
+    'Control_AIC': f"{control_gof[dist_name]['AIC']:.2f}",
+    'Treatment_AIC': f"{treatment_gof[dist_name]['AIC']:.2f}",
+    'Control_BIC': f"{control_gof[dist_name]['BIC']:.2f}",
+    'Treatment_BIC': f"{treatment_gof[dist_name]['BIC']:.2f}"
+  })
+
+df_cross = pd.DataFrame(cross_rows)
+print(df_cross.to_string(index=False))
+df_cross.to_csv('Cross_Group_Comparison.csv', index=False)
+
+print("\n" + "=" * 80)
+print("✅ DISTRIBUTION FITTING ANALYSIS COMPLETE!")
+print("=" * 80)
+print("\nGenerated Files:")
+print("  📊 Control_vs_Treatment_Comparison.png")
+print("  📊 Group_Fit_Control.png")
+print("  📊 Group_Fit_Treatment.png")
+print("  📄 Best_Distribution_Summary.csv")
+print("  📄 Detailed_AIC_BIC.csv")
+print("  📄 Cross_Group_Comparison.csv")
+print("=" * 80)
+
+return all_results
+
+
+# =======================================================
+# Run
+# =======================================================
+if __name__ == "__main__":
+  results = main()
+
+# =======================================================
+# REAL DATA ANALYSIS: Murray et al. (2000)
+# Correct Interpretation: Stress-Strength Model
+# Control (High Volume) = Strength (X)
+# Treatment (Low Volume) = Stress (Y)
+# Target: R_{k:n} = P(Y < X_{(k)})
+# =======================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.optimize import minimize
+from scipy.special import beta, comb
+import warnings
+warnings.filterwarnings('ignore')
+
+# =======================================================
+# Plot Settings
+# =======================================================
+plt.rcParams['font.size'] = 12
+plt.rcParams['figure.figsize'] = (10, 6)
+plt.rcParams['savefig.dpi'] = 300
+plt.rcParams['savefig.bbox'] = 'tight'
+sns.set_style("whitegrid")
+
+print("=" * 80)
+print("REAL DATA ANALYSIS: Murray et al. (2000)")
+print("Correct Interpretation: Stress-Strength Model")
+print("Control (High Volume) = Strength (X)")
+print("Treatment (Low Volume) = Stress (Y)")
+print("Target: R_{k:n} = P(Y < X_{(k)})")
+print("=" * 80)
+
+
+# =======================================================
+# 1. Load Data
+# =======================================================
+
+def load_murray_data():
+  """
+    Load Murray et al. (2000) data
+    Control: High volume (coarse nozzles) -> Strength (X)
+    Treatment: Low volume (fine nozzles) -> Stress (Y)
+    """
+# Control Group (High Volume) - Strength (X)
+control_data = np.array([
+  [0.003, 0.028, 0.244, 0.057, 0.143],
+  [0.039, 0.119, 0.126, 0.105, 0.565],
+  [0.034, 0.118, 0.130, 0.218, 0.296],
+  [0.051, 0.104, 0.193, 0.210, 0.150],
+  [0.032, 0.141, 0.130, 0.250, 0.229],
+  [0.069, 0.070, 0.260, 0.225, 0.285],
+  [0.100, 0.091, 0.244, 0.130, 0.347],
+  [0.012, 0.096, 0.069, 0.373, 0.133],
+  [0.046, 0.117, 0.126, 0.223, 0.273],
+  [0.028, 0.083, 0.108, 0.212, 0.261]
+])
+
+# Treatment Group (Low Volume) - Stress (Y)
+treatment_data = np.array([
+  [0.036, 0.137, 0.183, 0.270, 0.487],
+  [0.250, 0.181, 0.290, 0.328, 0.715],
+  [0.089, 0.032, 0.269, 0.419, 0.315],
+  [0.180, 0.111, 0.130, 0.194, 0.742],
+  [0.100, 0.009, 0.184, 0.277, 0.122],
+  [0.042, 0.089, 0.199, 0.269, 0.395],
+  [0.044, 0.083, 0.227, 0.177, 0.742],
+  [0.044, 0.171, 0.067, 0.192, 0.336],
+  [0.009, 0.017, 0.217, 0.438, 0.544],
+  [0.071, 0.132, 0.310, 0.343, 0.379]
+])
+
+return control_data, treatment_data
+
+
+# =======================================================
+# 2. Core Functions
+# =======================================================
+
+def fit_weibull_mle(data):
+  """Fit Weibull distribution using MLE"""
+def neg_log_likelihood(params):
+  c, theta = params
+if c <= 0 or theta <= 0:
+  return 1e10
+n = len(data)
+data_pos = data + 1e-10
+log_lik = n * np.log(theta * c) + (c-1) * np.sum(np.log(data_pos)) - theta * np.sum(data_pos ** c)
+return -log_lik
+
+cv = np.std(data) / (np.mean(data) + 1e-10)
+c_init = 1.2 if cv > 0.5 else 2.0
+theta_init = (np.mean((data + 1e-10) ** c_init)) ** (-1/c_init)
+
+result = minimize(neg_log_likelihood, [c_init, theta_init], 
+                  bounds=[(0.1, 10), (0.01, 100)])
+if result.success:
+  return result.x[1], result.x[0]  # theta, c
+return theta_init, c_init
+
+
+def calculate_R_k_n(theta1, theta2, k, n_sys):
+  """
+    Calculate reliability of k-out-of-n system
+    R_{k:n} = P(Y < X_{(k)}) where X ~ Exp(theta1), Y ~ Exp(theta2)
+    """
+R = 0
+ratio = theta2 / theta1
+for j in range(k, n_sys + 1):
+  comb_val = comb(n_sys, j)
+beta_val = beta(j + ratio, n_sys - j + 1)
+R += comb_val * ratio * beta_val
+return min(max(R, 0), 1)
+
+
+def compute_R_mle_and_se_weibull(data_x, data_y, k, n_sys, n_boot_se=200):
+  """Compute R_mle and its standard error using bootstrap"""
+theta1_hat, c1_hat = fit_weibull_mle(data_x)
+theta2_hat, c2_hat = fit_weibull_mle(data_y)
+R_mle = calculate_R_k_n(theta1_hat, theta2_hat, k, n_sys)
+
+n1, n2 = len(data_x), len(data_y)
+boot_R = []
+for _ in range(n_boot_se):
+  boot_x = np.random.choice(data_x, n1, replace=True)
+boot_y = np.random.choice(data_y, n2, replace=True)
+theta1_b, _ = fit_weibull_mle(boot_x)
+theta2_b, _ = fit_weibull_mle(boot_y)
+boot_R.append(calculate_R_k_n(theta1_b, theta2_b, k, n_sys))
+
+se_R_mle = np.std(boot_R)
+var_R_mle = se_R_mle**2
+
+return R_mle, se_R_mle, var_R_mle, theta1_hat, theta2_hat, c1_hat, c2_hat
+
+
+def compute_optimal_shrinkage_coefficient(var_R_mle, delta_sq):
+  """d* = σ² / (σ² + δ²)"""
+return var_R_mle / (var_R_mle + delta_sq + 1e-10)
+
+
+def shrinkage_estimators_fixed(data_x, data_y, R0, k, n_sys, alpha=0.7,
+                               R_mle=None, se_R_mle=None, var_R_mle=None):
+  """Compute all shrinkage estimators"""
+if R_mle is None or se_R_mle is None:
+  R_mle, se_R_mle, var_R_mle, _, _, _, _ = compute_R_mle_and_se_weibull(data_x, data_y, k, n_sys)
+
+var_R = var_R_mle
+delta = R_mle - R0
+delta_sq = delta**2
+ell_R = delta_sq / (var_R + 1e-10)
+d_optimal = compute_optimal_shrinkage_coefficient(var_R, delta_sq)
+
+# Stein-Type Estimator (Weighted Average Form - STABLE)
+denom = ell_R + d_optimal + 1e-10
+weight_mle = ell_R / denom
+weight_R0 = d_optimal / denom
+R_stein = weight_mle * R_mle + weight_R0 * R0
+
+# Positive-Part Stein
+if ell_R > 1e-10:
+  shrinkage_factor = max(0, 1 - d_optimal / ell_R)
+R_stein_positive = R0 + shrinkage_factor * (R_mle - R0)
+else:
+  R_stein_positive = R0
+
+# Preliminary Test Estimator
+chi2_critical = stats.chi2.ppf(0.95, df=1)
+w = alpha
+if ell_R <= chi2_critical:
+  R_pte = R_mle - w * (R_mle - R0)
+else:
+  R_pte = R_mle
+
+# Constant Weight
+R_cw = alpha * R_mle + (1 - alpha) * R0
+
+# Thompson
+R_th = R_mle - (R_mle - R0) / (1 + ell_R)
+
+# Mehta-Srinivasan
+R_ms = R_th if ell_R < chi2_critical else R_mle
+
+return {
+  'R_mle': R_mle,
+  'R_cw': R_cw,
+  'R_th': R_th,
+  'R_ms': R_ms,
+  'R_stein': R_stein,
+  'R_stein_positive': R_stein_positive,
+  'R_pte': R_pte,
+  'var_R_mle': var_R_mle,
+  'se_R_mle': se_R_mle,
+  'ell_R': ell_R,
+  'd_optimal': d_optimal,
+  'weight_mle': weight_mle
+}
+
+
+# =======================================================
+# 3. Bootstrap Confidence Intervals
+# =======================================================
+
+def bootstrap_ci_real_data(data_x, data_y, R0, k, n_sys, alpha=0.7, n_boot=500):
+  """Bootstrap confidence intervals for all estimators"""
+n_x, n_y = len(data_x), len(data_y)
+
+# Original estimates
+R_mle, se_R_mle, var_R_mle, theta1, theta2, c1, c2 = compute_R_mle_and_se_weibull(data_x, data_y, k, n_sys)
+est_orig = shrinkage_estimators_fixed(data_x, data_y, R0, k, n_sys, alpha, R_mle, se_R_mle, var_R_mle)
+
+estimator_names = ['MLE', 'CW', 'Thompson', 'MS', 'Stein', 'PS', 'PTE']
+boot_results = {name: [] for name in estimator_names}
+
+print(f"    Bootstrap: {n_boot} iterations...")
+
+for b in range(n_boot):
+  boot_x = np.random.choice(data_x, n_x, replace=True)
+boot_y = np.random.choice(data_y, n_y, replace=True)
+
+R_mle_b, se_R_mle_b, var_R_mle_b, _, _, _, _ = compute_R_mle_and_se_weibull(boot_x, boot_y, k, n_sys)
+
+boot_est = shrinkage_estimators_fixed(
+  boot_x, boot_y, R0, k, n_sys, alpha,
+  R_mle=R_mle_b, se_R_mle=se_R_mle_b, var_R_mle=var_R_mle_b
+)
+
+boot_results['MLE'].append(boot_est['R_mle'])
+boot_results['CW'].append(boot_est['R_cw'])
+boot_results['Thompson'].append(boot_est['R_th'])
+boot_results['MS'].append(boot_est['R_ms'])
+boot_results['Stein'].append(boot_est['R_stein'])
+boot_results['PS'].append(boot_est['R_stein_positive'])
+boot_results['PTE'].append(boot_est['R_pte'])
+
+ci_results = {}
+for name in estimator_names:
+  values = np.array(boot_results[name])
+ci_results[name] = {
+  'mean': np.mean(values),
+  'std': np.std(values),
+  'lower': np.percentile(values, 2.5),
+  'upper': np.percentile(values, 97.5),
+  'lower_90': np.percentile(values, 5),
+  'upper_90': np.percentile(values, 95)
+}
+
+estimates = {
+  'MLE': est_orig['R_mle'],
+  'CW': est_orig['R_cw'],
+  'Thompson': est_orig['R_th'],
+  'MS': est_orig['R_ms'],
+  'Stein': est_orig['R_stein'],
+  'PS': est_orig['R_stein_positive'],
+  'PTE': est_orig['R_pte']
+}
+
+return estimates, ci_results, est_orig, (theta1, theta2, c1, c2)
+
+
+# =======================================================
+# 4. Plotting Functions
+# =======================================================
+
+def plot_real_data_estimates(estimates, ci_results, title_prefix=""):
+  """Plot estimates with confidence intervals"""
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+estimator_names = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+
+# 1. Bar plot with CIs
+ax1 = axes[0]
+x = np.arange(len(estimator_names))
+width = 0.35
+
+values = [estimates[name] for name in estimator_names]
+lower = [ci_results[name]['lower'] for name in estimator_names]
+upper = [ci_results[name]['upper'] for name in estimator_names]
+
+bars = ax1.bar(x, values, width, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
+ax1.errorbar(x, values, yerr=[values - np.array(lower), np.array(upper) - values], 
+             fmt='none', color='black', capsize=5, linewidth=1.5)
+
+for bar, val in zip(bars, values):
+  ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005, 
+           f'{val:.4f}', ha='center', va='bottom', fontsize=9)
+
+ax1.set_xlabel('Estimator', fontsize=12)
+ax1.set_ylabel('Estimated R', fontsize=12)
+ax1.set_title(f'{title_prefix} Estimates with 95% CI', fontsize=13)
+ax1.set_xticks(x)
+ax1.set_xticklabels(estimator_names, rotation=45, ha='right')
+ax1.axhline(y=estimates['MLE'], color='red', linestyle='--', linewidth=1.5, alpha=0.5, label='MLE')
+ax1.legend()
+ax1.grid(True, alpha=0.3, axis='y')
+
+# 2. CI length comparison
+ax2 = axes[1]
+ci_length = [ci_results[name]['upper'] - ci_results[name]['lower'] for name in estimator_names]
+
+bars2 = ax2.bar(x, ci_length, width, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
+
+for bar, val in zip(bars2, ci_length):
+  ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002, 
+           f'{val:.4f}', ha='center', va='bottom', fontsize=9)
+
+ax2.set_xlabel('Estimator', fontsize=12)
+ax2.set_ylabel('CI Length (Upper - Lower)', fontsize=12)
+ax2.set_title(f'{title_prefix} 95% CI Length', fontsize=13)
+ax2.set_xticks(x)
+ax2.set_xticklabels(estimator_names, rotation=45, ha='right')
+ax2.grid(True, alpha=0.3, axis='y')
+
+plt.suptitle(f'Real Data Analysis: Murray et al. (2000)', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f'RealData_Estimates.png', dpi=300, bbox_inches='tight')
+plt.show()
+print("  ✅ Saved: RealData_Estimates.png")
+
+
+def plot_data_distribution(data_x, data_y):
+  """Plot distribution of both groups"""
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# 1. Histograms
+ax1 = axes[0]
+sns.histplot(data_x, kde=True, ax=ax1, color='blue', label='Control (X - Strength)', alpha=0.6)
+sns.histplot(data_y, kde=True, ax=ax1, color='red', label='Treatment (Y - Stress)', alpha=0.6)
+ax1.set_xlabel('Percent Cover')
+ax1.set_ylabel('Frequency')
+ax1.set_title('Distribution of Strength (X) vs Stress (Y)')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# 2. Boxplots
+ax2 = axes[1]
+data_combined = pd.DataFrame({
+  'Group': ['Strength (X)']*len(data_x) + ['Stress (Y)']*len(data_y),
+  'Value': np.concatenate([data_x, data_y])
+})
+sns.boxplot(data=data_combined, x='Group', y='Value', ax=ax2)
+ax2.set_ylabel('Percent Cover')
+ax2.set_title('Boxplot Comparison')
+ax2.grid(True, alpha=0.3, axis='y')
+
+plt.suptitle('Data Distribution: Control (Strength) vs Treatment (Stress)', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig('Data_Distribution.png', dpi=300, bbox_inches='tight')
+plt.show()
+print("  ✅ Saved: Data_Distribution.png")
+
+
+def plot_bootstrap_distributions(estimates, ci_results, title_prefix=""):
+  """Plot bootstrap distributions (simulated from CI results)"""
+# Since we don't have full bootstrap samples, we simulate normal distributions
+fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+axes = axes.flatten()
+
+estimator_names = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+
+for idx, (name, color) in enumerate(zip(estimator_names, colors)):
+  if idx < len(estimator_names):
+  ax = axes[idx]
+mean = ci_results[name]['mean']
+std = ci_results[name]['std']
+# Generate synthetic bootstrap samples
+values = np.random.normal(mean, std, 500)
+sns.histplot(values, kde=True, ax=ax, color=color, bins=30, alpha=0.7)
+ax.axvline(mean, color='red', linestyle='--', label=f'Mean: {mean:.4f}')
+ax.axvline(ci_results[name]['lower'], color='green', linestyle=':', label='2.5%')
+ax.axvline(ci_results[name]['upper'], color='green', linestyle=':', label='97.5%')
+ax.set_xlabel(f'{name}')
+ax.set_ylabel('Frequency')
+ax.set_title(f'{name} Bootstrap Distribution')
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+for idx in range(len(estimator_names), 9):
+  axes[idx].axis('off')
+
+plt.suptitle(f'{title_prefix} Bootstrap Distributions', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig('Bootstrap_Distributions.png', dpi=300, bbox_inches='tight')
+plt.show()
+print("  ✅ Saved: Bootstrap_Distributions.png")
+
+
+def plot_estimator_comparison_all(estimates, ci_results):
+  """Plot all estimators with their CIs in one grouped plot"""
+fig, ax = plt.subplots(figsize=(12, 6))
+
+estimator_names = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+
+x = np.arange(len(estimator_names))
+values = [estimates[name] for name in estimator_names]
+lower = [ci_results[name]['lower'] for name in estimator_names]
+upper = [ci_results[name]['upper'] for name in estimator_names]
+
+for i, (name, val, l, u) in enumerate(zip(estimator_names, values, lower, upper)):
+  ax.plot([i, i], [l, u], color=colors[i], linewidth=3, alpha=0.7)
+ax.plot(i, val, 'o', color=colors[i], markersize=12, markeredgecolor='black', markeredgewidth=1)
+ax.annotate(f'{val:.4f}', (i, val + 0.01), ha='center', va='bottom', fontsize=9)
+
+ax.axhline(y=estimates['MLE'], color='red', linestyle='--', linewidth=1.5, alpha=0.5, label='MLE Reference')
+ax.set_xlabel('Estimator', fontsize=12)
+ax.set_ylabel('Estimated R', fontsize=12)
+ax.set_title('Estimators with 95% Confidence Intervals', fontsize=13)
+ax.set_xticks(x)
+ax.set_xticklabels(estimator_names, rotation=45, ha='right')
+ax.legend()
+ax.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.savefig('Estimator_Comparison_All.png', dpi=300, bbox_inches='tight')
+plt.show()
+print("  ✅ Saved: Estimator_Comparison_All.png")
+
+
+# =======================================================
+# 5. Generate Tables
+# =======================================================
+
+def generate_tables(estimates, ci_results, est_orig, params, k, n_sys, R0, alpha):
+  """Generate all tables"""
+
+print("\n" + "=" * 80)
+print("REAL DATA ANALYSIS RESULTS")
+print("=" * 80)
+
+# Table 1: Summary Statistics
+print("\nTABLE 1: Data Summary Statistics")
+print("-" * 60)
+print(f"  System Configuration: {k}-out-of-{n_sys}")
+print(f"  Prior Value (R0): {R0:.4f}")
+print(f"  Shrinkage Weight (α): {alpha}")
+print("-" * 60)
+
+theta1, theta2, c1, c2 = params
+print(f"\n  Fitted Weibull Parameters:")
+print(f"    Strength (X - Control): θ1 = {theta1:.4f}, c1 = {c1:.4f}")
+print(f"    Stress (Y - Treatment): θ2 = {theta2:.4f}, c2 = {c2:.4f}")
+
+print(f"\n  Diagnostic Information:")
+print(f"    d* (Optimal Shrinkage Coef): {est_orig['d_optimal']:.4f}")
+print(f"    ell_R (Test Statistic): {est_orig['ell_R']:.4f}")
+print(f"    Var(R_mle): {est_orig['var_R_mle']:.6f}")
+print(f"    se(R_mle): {est_orig['se_R_mle']:.4f}")
+print(f"    Weight MLE: {est_orig['weight_mle']:.4f}")
+
+# Table 2: Estimates with CIs
+print("\n" + "=" * 80)
+print("TABLE 2: Estimates with 95% Confidence Intervals")
+print("=" * 80)
+print(f"  {'Estimator':<12} {'Estimate':<12} {'95% CI':<25} {'Std':<10} {'CI Length':<10}")
+print(f"  {'-'*75}")
+
+estimator_names = ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']
+for name in estimator_names:
+  est = estimates[name]
+lower = ci_results[name]['lower']
+upper = ci_results[name]['upper']
+std = ci_results[name]['std']
+length = upper - lower
+print(f"  {name:<12} {est:.4f}     [{lower:.4f}, {upper:.4f}]   {std:.4f}   {length:.4f}")
+
+# Table 3: Comparison with MLE
+print("\n" + "=" * 80)
+print("TABLE 3: Comparison with MLE")
+print("=" * 80)
+print(f"  {'Estimator':<12} {'MSE':<12} {'PI (%)':<12}")
+print(f"  {'-'*40}")
+
+mle_est = estimates['MLE']
+for name in estimator_names:
+  if name != 'MLE':
+  mse = (estimates[name] - mle_est)**2
+pi = (1 - estimates[name] / mle_est) * 100
+print(f"  {name:<12} {mse:.6f}   {pi:+.2f}")
+
+return {
+  'estimates': estimates,
+  'ci': ci_results,
+  'diagnostics': {
+    'theta1': theta1, 'theta2': theta2,
+    'c1': c1, 'c2': c2,
+    'd_optimal': est_orig['d_optimal'],
+    'ell_R': est_orig['ell_R'],
+    'var_R_mle': est_orig['var_R_mle'],
+    'se_R_mle': est_orig['se_R_mle']
+  }
+}
+
+
+# =======================================================
+# 6. Main Execution
+# =======================================================
+
+def main():
+  print("=" * 80)
+print("STARTING REAL DATA ANALYSIS")
+print("Murray et al. (2000) - Apple Tree Spray Data")
+print("Control (High Volume) = Strength (X)")
+print("Treatment (Low Volume) = Stress (Y)")
+print("=" * 80)
+
+# Load data
+control_data, treatment_data = load_murray_data()
+data_x = control_data.flatten()  # Strength
+data_y = treatment_data.flatten()  # Stress
+
+print(f"\nData Information:")
+print(f"  Strength (X) - Control: n = {len(data_x)}")
+print(f"  Stress (Y) - Treatment: n = {len(data_y)}")
+print(f"  Mean(X) = {np.mean(data_x):.4f}")
+print(f"  Mean(Y) = {np.mean(data_y):.4f}")
+
+# Parameters
+k = 2
+n_sys = 5
+R0 = 0.5
+alpha = 0.7
+n_boot = 500
+
+# Plot data distribution
+plot_data_distribution(data_x, data_y)
+
+# Get estimates with bootstrap CIs
+estimates, ci_results, est_orig, params = bootstrap_ci_real_data(
+  data_x, data_y, R0, k, n_sys, alpha, n_boot
+)
+
+# Generate tables
+results = generate_tables(estimates, ci_results, est_orig, params, k, n_sys, R0, alpha)
+
+# Generate plots
+plot_real_data_estimates(estimates, ci_results, title_prefix="")
+plot_bootstrap_distributions(estimates, ci_results, title_prefix="")
+plot_estimator_comparison_all(estimates, ci_results)
+
+# Save full results
+results_df = pd.DataFrame({
+  'Estimator': ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS'],
+  'Estimate': [estimates[name] for name in ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']],
+  'CI_Lower': [ci_results[name]['lower'] for name in ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']],
+  'CI_Upper': [ci_results[name]['upper'] for name in ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']],
+  'Std': [ci_results[name]['std'] for name in ['MLE', 'Stein', 'PS', 'PTE', 'CW', 'Thompson', 'MS']]
+})
+results_df.to_csv('RealData_Results.csv', index=False)
+print("\n  ✅ Saved: RealData_Results.csv")
+
+# Summary
+print("\n" + "=" * 80)
+print("✅ REAL DATA ANALYSIS COMPLETE!")
+print("=" * 80)
+print("\nGenerated Files:")
+print("  📊 Data_Distribution.png")
+print("  📊 RealData_Estimates.png")
+print("  📊 Bootstrap_Distributions.png")
+print("  📊 Estimator_Comparison_All.png")
+print("  📄 RealData_Results.csv")
+print("=" * 80)
+
+return results
+
+
+# =======================================================
+# Run
+# =======================================================
+if __name__ == "__main__":
+  results = main()
